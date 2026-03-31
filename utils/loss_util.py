@@ -4,6 +4,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
+# ============================================================
+# [原 AVSegFormer 语义级损失 — 保留但不注释]
+# 用于像素级前景/背景分割的辅助损失 (BCE + IoU + Dice)
+# OVSegFormer 实例分割中不使用此类
+# ============================================================
+
 class IouSemanticAwareLoss(nn.Module):
     """
     真正的 IouSemanticAwareLoss 实现
@@ -57,7 +63,33 @@ class IouSemanticAwareLoss(nn.Module):
         return total_loss, loss_dict
 
 
+# ============================================================
+# [OVSegFormer 实例级损失函数]
+# ============================================================
+
 class AlignedInstanceSegLoss(nn.Module):
+    """
+    对齐式实例分割损失 — 直接按 query 位置与 GT 一一对应，无需 Hungarian 匹配
+
+    核心思路:
+        每个 query 由细胞质心生成，天然与对应的 GT 实例对齐，
+        因此直接对正样本 query 计算 mask BCE + Dice 损失。
+        适用于训练初期或 query-GT 一一对应的场景。
+
+    损失组成:
+        1. cls_loss:    目标性分类损失 (BCE)，区分有效/无效 query
+        2. mask_bce:    掩膜二值交叉熵 (仅对正样本 query)
+        3. mask_dice:   掩膜 Dice 损失 (仅对正样本 query)
+        4. overlap:     实例间重叠惩罚，抑制预测掩膜的重叠区域
+
+    Args:
+        cls_weight:        分类损失权重 (默认 0.0 表示不使用)
+        mask_bce_weight:   掩膜 BCE 权重
+        mask_dice_weight:  掩膜 Dice 权重
+        overlap_weight:    重叠惩罚权重
+        mask_loss_size:    计算掩膜损失时的下采样尺寸 (节省显存)
+        overlap_loss_size: 计算重叠损失时的下采样尺寸
+    """
     def __init__(
         self,
         cls_weight=0.0,
@@ -76,6 +108,7 @@ class AlignedInstanceSegLoss(nn.Module):
         self.overlap_loss_size = overlap_loss_size
 
     def _resize_masks(self, pred_masks, target_masks):
+        """将预测掩膜双线性插值到 GT 掩膜尺寸 — [B, N, H, W]"""
         if pred_masks.shape[-2:] == target_masks.shape[-2:]:
             return pred_masks
         batch_queries = pred_masks.shape[0] * pred_masks.shape[1]
@@ -84,6 +117,7 @@ class AlignedInstanceSegLoss(nn.Module):
         return pred_masks.reshape(target_masks.shape[0], target_masks.shape[1], target_masks.shape[-2], target_masks.shape[-1])
 
     def _dice_loss(self, pred_logits, target_masks):
+        """计算 Dice 损失: 1 - (2*交集)/(pred+target)"""
         pred_probs = torch.sigmoid(pred_logits)
         pred_flat = pred_probs.flatten(1)
         target_flat = target_masks.flatten(1)
@@ -93,6 +127,10 @@ class AlignedInstanceSegLoss(nn.Module):
         return 1.0 - dice
 
     def _downsample_pair_masks(self, pred_masks, target_masks):
+        """
+        将掩膜下采样到 mask_loss_size×mask_loss_size — 大幅减少显存占用
+        预测掩膜用双线性插值，GT 掩膜用最近邻插值 (保持二值性)
+        """
         if self.mask_loss_size is None:
             return pred_masks, target_masks
         target_size = (int(self.mask_loss_size), int(self.mask_loss_size))
@@ -112,6 +150,13 @@ class AlignedInstanceSegLoss(nn.Module):
         return pred_masks, target_masks
 
     def _overlap_loss(self, pred_masks, valid_mask):
+        """
+        计算实例间重叠惩罚 — 鼓励不同 query 的预测掩膜尽量不重叠
+
+        对每个 batch，取所有有效 query 的预测掩膜，
+        计算两两之间的重叠率 (交集/较小面积)，
+        取上三角均值作为 batch 的重叠损失。
+        """
         pred_probs = torch.sigmoid(pred_masks)
         if self.overlap_loss_size is not None and pred_probs.shape[-2:] != (int(self.overlap_loss_size), int(self.overlap_loss_size)):
             pred_probs = F.interpolate(
@@ -139,8 +184,24 @@ class AlignedInstanceSegLoss(nn.Module):
         return torch.stack(overlap_terms).mean()
 
     def forward(self, pred_cls, pred_masks, target_masks, target_valid_mask):
+        """
+        前向计算对齐式实例分割损失
+
+        Args:
+            pred_cls:          [B, N, 1] query 目标性 logits
+            pred_masks:        [B, N, H', W'] query 掩膜 logits
+            target_masks:      [B, N_gt_max, H, W] GT 实例掩膜 (已 padding)
+            target_valid_mask: [B, N_gt_max] 有效实例标记
+
+        Returns:
+            total_loss: 加权总损失
+            loss_dict:  各项损失的标量值 (用于日志记录)
+            None:       对齐损失不需要返回匹配索引
+        """
         loss_dict = {}
         total_loss = pred_masks.new_tensor(0.0)
+
+        # 1. 分类损失: 区分有效 query (有对应 GT 细胞) vs 无效 query (padding)
         cls_loss = pred_masks.new_tensor(0.0)
         if self.cls_weight > 0:
             query_targets = target_valid_mask.float()
@@ -148,6 +209,7 @@ class AlignedInstanceSegLoss(nn.Module):
             total_loss = total_loss + self.cls_weight * cls_loss
         loss_dict['inst_cls_loss'] = cls_loss.item()
 
+        # 2. 掩膜损失: 仅对正样本 query 计算 BCE + Dice
         pred_masks = self._resize_masks(pred_masks, target_masks)
         positive_mask = target_valid_mask
         if positive_mask.any():
@@ -163,6 +225,7 @@ class AlignedInstanceSegLoss(nn.Module):
         loss_dict['inst_mask_bce_loss'] = bce_loss.item()
         loss_dict['inst_mask_dice_loss'] = dice_loss.item()
 
+        # 3. 重叠惩罚: 抑制不同 query 的预测掩膜互相重叠
         overlap_loss = pred_masks.new_tensor(0.0)
         if self.overlap_weight > 0:
             overlap_loss = self._overlap_loss(pred_masks, target_valid_mask)
@@ -174,6 +237,16 @@ class AlignedInstanceSegLoss(nn.Module):
 
 
 class HungarianMatcher(nn.Module):
+    """
+    匈牙利匹配器 — 为每个 GT 实例找到最优的 query 分配
+
+    代价矩阵由三部分加权求和:
+        1. cls_cost:  分类概率代价 (负 sigmoid 值，倾向匹配高分 query)
+        2. mask_cost: 掩膜像素级 BCE 代价
+        3. dice_cost: 掩膜 Dice 代价
+
+    使用 scipy.optimize.linear_sum_assignment 求解最优二部图匹配。
+    """
     def __init__(self, cls_cost=1.0, mask_cost=1.0, dice_cost=1.0):
         super().__init__()
         self.cls_cost = cls_cost
@@ -181,6 +254,7 @@ class HungarianMatcher(nn.Module):
         self.dice_cost = dice_cost
 
     def _resize_masks(self, pred_masks, target_masks):
+        """将预测掩膜插值到 GT 尺寸 — [B, N, H, W]"""
         if pred_masks.shape[-2:] == target_masks.shape[-2:]:
             return pred_masks
         batch_size, query_num = pred_masks.shape[:2]
@@ -189,13 +263,27 @@ class HungarianMatcher(nn.Module):
         return pred_masks.reshape(batch_size, query_num, target_masks.shape[-2], target_masks.shape[-1])
 
     def _pairwise_mask_cost(self, pred_logits, target_masks):
+        """
+        计算预测-目标掩膜的逐对 BCE 代价矩阵
+
+        Returns:
+            cost: [N_pred, N_gt] 每对 (pred, gt) 的平均像素 BCE 代价
+        """
         pred_flat = pred_logits.flatten(1)
         target_flat = target_masks.flatten(1)
+        # 正像素代价: softplus(-logit) * target
         pos_cost = F.softplus(-pred_flat) @ target_flat.t()
+        # 负像素代价: softplus(logit) * (1-target)
         neg_cost = F.softplus(pred_flat) @ (1.0 - target_flat).t()
         return (pos_cost + neg_cost) / pred_flat.shape[1]
 
     def _pairwise_dice_cost(self, pred_logits, target_masks, eps=1e-6):
+        """
+        计算预测-目标掩膜的逐对 Dice 代价矩阵
+
+        Returns:
+            cost: [N_pred, N_gt] 每对的 1 - Dice
+        """
         pred_probs = torch.sigmoid(pred_logits).flatten(1)
         target_flat = target_masks.flatten(1)
         inter = pred_probs @ target_flat.t()
@@ -206,6 +294,18 @@ class HungarianMatcher(nn.Module):
 
     @torch.no_grad()
     def forward(self, pred_cls, pred_masks, target_masks, target_valid_mask):
+        """
+        执行匈牙利匹配
+
+        Args:
+            pred_cls:          [B, N, 1] query 分类 logits
+            pred_masks:        [B, N, H', W'] 预测掩膜 logits
+            target_masks:      [B, N_gt_max, H, W] GT 实例掩膜
+            target_valid_mask: [B, N_gt_max] 有效 GT 标记
+
+        Returns:
+            indices: list of (pred_indices, gt_indices) 元组，每个 batch 一组
+        """
         if pred_masks.shape[-2:] != target_masks.shape[-2:]:
             batch_queries = pred_masks.shape[0] * pred_masks.shape[1]
             pred_masks = pred_masks.reshape(batch_queries, 1, pred_masks.shape[-2], pred_masks.shape[-1])
@@ -223,10 +323,12 @@ class HungarianMatcher(nn.Module):
                 continue
             cur_pred_masks = pred_masks[batch_idx]
             cur_tgt_masks = target_masks[batch_idx][tgt_mask].float()
+            # 构建代价矩阵: cls + mask_bce + dice
             cls_cost = -cls_prob[batch_idx].unsqueeze(1).expand(-1, tgt_count)
             mask_cost = self._pairwise_mask_cost(cur_pred_masks, cur_tgt_masks)
             dice_cost = self._pairwise_dice_cost(cur_pred_masks, cur_tgt_masks)
             total_cost = self.cls_cost * cls_cost + self.mask_cost * mask_cost + self.dice_cost * dice_cost
+            # Hungarian 最优匹配
             row_ind, col_ind = linear_sum_assignment(total_cost.detach().cpu().numpy())
             indices.append((
                 torch.as_tensor(row_ind, dtype=torch.long, device=pred_cls.device),
@@ -236,6 +338,31 @@ class HungarianMatcher(nn.Module):
 
 
 class HungarianInstanceSegLoss(nn.Module):
+    """
+    匈牙利匹配式实例分割损失 — 通过 Hungarian 最优匹配关联 query 和 GT
+
+    与 AlignedInstanceSegLoss 的区别:
+        - Aligned: query 与 GT 按位置直接对齐 (适用于一一对应场景)
+        - Hungarian: 通过代价矩阵做最优匹配 (适用于一对多/多对一场景，更鲁棒)
+
+    损失组成:
+        1. cls_loss:    加权分类损失 (正样本权重=1.0，负样本权重=no_object_weight)
+        2. mask_bce:    匹配对的掩膜 BCE 损失
+        3. mask_dice:   匹配对的掩膜 Dice 损失
+        4. overlap:     实例间重叠惩罚
+
+    Args:
+        cls_weight:           分类损失权重
+        mask_bce_weight:      掩膜 BCE 权重
+        mask_dice_weight:     掩膜 Dice 权重
+        overlap_weight:       重叠惩罚权重
+        no_object_weight:     负样本 (无对应 GT 的 query) 的 BCE 权重
+        matcher_cls_cost:     匹配器中分类代价系数
+        matcher_mask_cost:    匹配器中掩膜代价系数
+        matcher_dice_cost:    匹配器中 Dice 代价系数
+        mask_loss_size:       掩膜损失下采样尺寸
+        overlap_loss_size:    重叠损失下采样尺寸
+    """
     def __init__(
         self,
         cls_weight=1.0,
@@ -264,6 +391,7 @@ class HungarianInstanceSegLoss(nn.Module):
         )
 
     def _resize_masks(self, pred_masks, target_masks):
+        """将预测掩膜插值到 GT 尺寸 — [B, N, H, W]"""
         if pred_masks.shape[-2:] == target_masks.shape[-2:]:
             return pred_masks
         batch_size, query_num = pred_masks.shape[:2]
@@ -272,6 +400,7 @@ class HungarianInstanceSegLoss(nn.Module):
         return flat_masks.reshape(batch_size, query_num, target_masks.shape[-2], target_masks.shape[-1])
 
     def _dice_loss(self, pred_logits, target_masks):
+        """计算 Dice 损失: 1 - (2*交集)/(pred+target)"""
         pred_probs = torch.sigmoid(pred_logits).flatten(1)
         target_flat = target_masks.flatten(1)
         intersection = (pred_probs * target_flat).sum(-1)
@@ -280,6 +409,10 @@ class HungarianInstanceSegLoss(nn.Module):
         return 1.0 - dice
 
     def _downsample_pair_masks(self, pred_masks, target_masks):
+        """
+        将匹配对的掩膜下采样到 mask_loss_size — 减少显存
+        预测用双线性插值，GT 用最近邻 (保持二值)
+        """
         if self.mask_loss_size is None:
             return pred_masks, target_masks
         target_size = (int(self.mask_loss_size), int(self.mask_loss_size))
@@ -299,6 +432,12 @@ class HungarianInstanceSegLoss(nn.Module):
         return pred_masks, target_masks
 
     def _overlap_loss(self, pred_masks, positive_mask):
+        """
+        计算被匹配为正样本的 query 之间的掩膜重叠惩罚
+
+        与 AlignedInstanceSegLoss 中的重叠损失类似，
+        但此处只对 Hungarian 匹配判定为正样本的 query 计算。
+        """
         pred_probs = torch.sigmoid(pred_masks)
         if self.overlap_loss_size is not None and pred_probs.shape[-2:] != (int(self.overlap_loss_size), int(self.overlap_loss_size)):
             pred_probs = F.interpolate(
@@ -325,9 +464,27 @@ class HungarianInstanceSegLoss(nn.Module):
         return torch.stack(overlap_terms).mean()
 
     def forward(self, pred_cls, pred_masks, target_masks, target_valid_mask):
+        """
+        前向计算匈牙利匹配式实例分割损失
+
+        Args:
+            pred_cls:          [B, N, 1] query 分类 logits
+            pred_masks:        [B, N, H', W'] query 掩膜 logits
+            target_masks:      [B, N_gt_max, H, W] GT 实例掩膜
+            target_valid_mask: [B, N_gt_max] 有效 GT 标记
+
+        Returns:
+            total_loss:      加权总损失
+            loss_dict:       各项损失的标量值
+            matched_indices: 匹配结果 list of (pred_idx, gt_idx)
+        """
+        # 将预测掩膜 resize 到 GT 尺寸
         pred_masks = self._resize_masks(pred_masks, target_masks)
+
+        # Step 1: 匈牙利匹配 — 找到每个 GT 实例的最优 query 分配
         matched_indices = self.matcher(pred_cls, pred_masks, target_masks, target_valid_mask)
 
+        # Step 2: 根据匹配结果构建分类目标
         cls_targets = pred_cls.new_zeros(pred_cls.shape[:2])
         positive_mask = torch.zeros_like(cls_targets, dtype=torch.bool)
         matched_pred_masks = []
@@ -342,10 +499,12 @@ class HungarianInstanceSegLoss(nn.Module):
             matched_pred_masks.append(pred_masks[batch_idx, pred_idx])
             matched_target_masks.append(valid_target_masks[tgt_idx])
 
+        # Step 3: 加权分类损失 — 负样本权重较低，防止淹没正样本梯度
         cls_weights = pred_cls.new_full(cls_targets.shape, self.no_object_weight)
         cls_weights[cls_targets > 0] = 1.0
         cls_loss = F.binary_cross_entropy_with_logits(pred_cls.squeeze(-1), cls_targets, weight=cls_weights)
 
+        # Step 4: 匹配对的掩膜损失 (BCE + Dice)，下采样后计算
         if len(matched_pred_masks) > 0:
             matched_pred_masks = torch.cat(matched_pred_masks, dim=0)
             matched_target_masks = torch.cat(matched_target_masks, dim=0)
@@ -359,6 +518,7 @@ class HungarianInstanceSegLoss(nn.Module):
             mask_bce_loss = pred_masks.new_tensor(0.0)
             mask_dice_loss = pred_masks.new_tensor(0.0)
 
+        # Step 5: 重叠惩罚
         overlap_loss = pred_masks.new_tensor(0.0)
         if self.overlap_weight > 0:
             overlap_loss = self._overlap_loss(pred_masks, positive_mask)
@@ -378,6 +538,10 @@ class HungarianInstanceSegLoss(nn.Module):
         }
         return total_loss, loss_dict, matched_indices
 
+
+# ============================================================
+# [原 AVSegFormer 损失记录工具 — 保留但不注释]
+# ============================================================
 
 class LossUtil:
     def __init__(self, weight_dict, **kwargs) -> None:

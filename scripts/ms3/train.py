@@ -1,6 +1,6 @@
 import sys
 import os
-# [新增] 将项目根目录加入 python 搜索路径
+# 将项目根目录加入 python 搜索路径，使 import model / import dataloader 等模块能正确解析
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.append(project_root)
@@ -24,7 +24,9 @@ from scripts.ms3.utility import (
     postprocess_instance_predictions,
 )
 
+
 def compute_grad_norm(parameters, norm_type=2.0):
+    """计算模型参数梯度的 L_p 范数，用于监控梯度爆炸/消失"""
     params = [p for p in parameters if p.grad is not None]
     if len(params) == 0:
         return 0.0
@@ -37,7 +39,13 @@ def compute_grad_norm(parameters, norm_type=2.0):
         total += grad_norm ** norm_type
     return float(total ** (1.0 / norm_type))
 
+
 def summarize_query_scores(output_cls, query_valid_mask, score_threshold):
+    """
+    统计 query objectness 分数的分布 (诊断用)
+
+    用于判断分类头是否饱和 (所有分数都接近 1.0 说明阈值失去筛选作用)
+    """
     scores = torch.sigmoid(output_cls.squeeze(-1))
     valid_scores = scores[query_valid_mask]
     if valid_scores.numel() == 0:
@@ -48,10 +56,12 @@ def summarize_query_scores(output_cls, query_valid_mask, score_threshold):
         score_std=float(valid_scores.std(unbiased=False).item()),
         score_min=float(valid_scores.min().item()),
         score_max=float(valid_scores.max().item()),
-        keep_ratio=keep_ratio,
+        keep_ratio=keep_ratio,  # 超过阈值的 query 比例
     )
 
+
 def build_scheduler(optimizer, cfg):
+    """根据配置构建学习率调度器 (支持 CosineAnnealing / MultiStep / StepLR)"""
     sched_cfg = getattr(cfg, 'lr_scheduler', None)
     if sched_cfg is None:
         return None
@@ -70,7 +80,9 @@ def build_scheduler(optimizer, cfg):
         return torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
     raise ValueError(f'Unsupported lr_scheduler.type: {sched_cfg.type}')
 
+
 def compute_basic_metrics(pred_logits, target, threshold=0.5, eps=1e-6):
+    """计算语义级分割指标 (precision, recall, F1, IoU, Dice)"""
     prob = torch.sigmoid(pred_logits)
     pred = (prob > threshold).float()
     target = target.float()
@@ -91,7 +103,9 @@ def compute_basic_metrics(pred_logits, target, threshold=0.5, eps=1e-6):
         'dice': dice.mean().item()
     }
 
+
 def compute_omics_coverage(pred_logits, omics_x, mask_size, threshold=0.5):
+    """计算转录本被预测掩膜覆盖的比例 (评估预测质量)"""
     prob = torch.sigmoid(pred_logits)
     pred = (prob > threshold).float()
     if pred.dim() == 4:
@@ -109,7 +123,14 @@ def compute_omics_coverage(pred_logits, omics_x, mask_size, threshold=0.5):
         return 0.0
     return float(sum(coverages) / len(coverages))
 
+
 def aggregate_query_masks(output_cls, output_mask, query_valid_mask, query_score_threshold=None, apply_score_threshold=True):
+    """
+    将多个 query 的掩膜聚合为单一语义分割图
+
+    策略: 每个像素取所有 query 中 score * mask_prob 最大的值
+    若某个样本所有 query 都低于阈值，则保留最高分的那个 query (兜底)
+    """
     query_scores = torch.sigmoid(output_cls.squeeze(-1))
     query_scores = query_scores.masked_fill(~query_valid_mask, 0.0)
     keep_mask = query_valid_mask
@@ -118,6 +139,7 @@ def aggregate_query_masks(output_cls, output_mask, query_valid_mask, query_score
         any_valid = query_valid_mask.any(dim=1)
         no_keep = ~keep_mask.any(dim=1) & any_valid
         if no_keep.any():
+            # 兜底: 保留每个样本最高分的 query
             masked_scores = query_scores.masked_fill(~query_valid_mask, -1.0)
             top_idx = masked_scores.argmax(dim=1)
             keep_mask[no_keep, :] = False
@@ -125,34 +147,65 @@ def aggregate_query_masks(output_cls, output_mask, query_valid_mask, query_score
     mask_prob = torch.sigmoid(output_mask)
     weighted_prob = mask_prob * query_scores[:, :, None, None]
     weighted_prob = weighted_prob.masked_fill(~keep_mask[:, :, None, None], 0.0)
-    pred_prob = weighted_prob.max(dim=1, keepdim=True)[0]
+    pred_prob = weighted_prob.max(dim=1, keepdim=True)[0]  # 取每个像素最大值
     pred_prob = pred_prob.clamp_(1e-4, 1.0 - 1e-4)
     return torch.logit(pred_prob)
 
+
 def custom_collate_fn(batch):
-    """ 自定义整理函数，处理变长的点云数据和质心 """
+    """
+    自定义 batch 整理函数 — 处理变长细胞数和转录本数
+
+    由于每个 crop 包含的细胞数量和每个细胞的转录本数量不同，
+    需要将它们 padding 到 batch 内最大值，并生成对应的 valid mask
+
+    核心逻辑:
+        1. 细胞维度: pad 到 max_cells，生成 centroid_valid_mask
+        2. 转录本维度: pad 到 max_query_tx，生成 query_tx_mask
+        3. query_valid_mask = centroid_valid_mask & instance_target_valid
+           (仅当质心有效且有有效掩膜时，该 query 才参与训练)
+    """
     imgs = torch.stack([item['img'] for item in batch])
     masks = torch.stack([item['mask'] for item in batch])
-    omics_x = [item['omics_x'] for item in batch]
-    omics_gene_ids = [item['omics_gene_ids'] for item in batch]
-    omics_qv = [item['omics_qv'] for item in batch]
     centroids = [item['centroids'] for item in batch]
     instance_masks = [item['instance_masks'] for item in batch]
     instance_target_valid = [item['instance_target_valid'] for item in batch]
-    
+    query_tx_x = [item['query_tx_x'] for item in batch]
+    query_tx_gene_ids = [item['query_tx_gene_ids'] for item in batch]
+    query_tx_qv = [item['query_tx_qv'] for item in batch]
+
+    # 计算本 batch 中最大细胞数
     max_cells = max([c.shape[0] for c in centroids])
-    if max_cells == 0: max_cells = 1 
-    
+    if max_cells == 0: max_cells = 1
+
     padded_centroids = []
     centroid_valid_mask = []
     padded_instance_masks = []
     padded_instance_target_valid = []
+
+    # 计算本 batch 中每个细胞的最大转录本数
+    max_query_tx = 1
+    for sample_query_tx in query_tx_x:
+        for tx in sample_query_tx:
+            max_query_tx = max(max_query_tx, int(tx.shape[0]))
+
+    padded_query_tx_x = []
+    padded_query_tx_gene_ids = []
+    padded_query_tx_qv = []
+    padded_query_tx_mask = []
+
+    # 逐样本 padding
     for c in centroids:
         n = c.shape[0]
         idx = len(padded_centroids)
         cur_instance_masks = instance_masks[idx]
         cur_instance_valid = instance_target_valid[idx]
+        cur_query_tx_x = query_tx_x[idx]
+        cur_query_tx_gene_ids = query_tx_gene_ids[idx]
+        cur_query_tx_qv = query_tx_qv[idx]
+
         if n < max_cells:
+            # 细胞数不足 max_cells，用零向量填充
             pad = torch.zeros((max_cells - n, 2), dtype=c.dtype, device=c.device)
             padded_centroids.append(torch.cat([c, pad], dim=0))
             valid = torch.cat([
@@ -169,18 +222,67 @@ def custom_collate_fn(batch):
             centroid_valid_mask.append(torch.ones(max_cells, dtype=torch.bool, device=c.device))
             padded_instance_masks.append(cur_instance_masks)
             padded_instance_target_valid.append(cur_instance_valid)
-    
-    padded_centroids = torch.stack(padded_centroids)
-    centroid_valid_mask = torch.stack(centroid_valid_mask)
-    padded_instance_masks = torch.stack(padded_instance_masks)
-    padded_instance_target_valid = torch.stack(padded_instance_target_valid)
-    query_valid_mask = centroid_valid_mask & padded_instance_target_valid
+
+        # 逐细胞 padding 转录本
+        cur_padded_tx_x = []
+        cur_padded_tx_gene_ids = []
+        cur_padded_tx_qv = []
+        cur_padded_tx_mask = []
+        for cell_idx in range(max_cells):
+            if cell_idx < len(cur_query_tx_x):
+                tx_x = cur_query_tx_x[cell_idx]
+                tx_gene_ids = cur_query_tx_gene_ids[cell_idx]
+                tx_qv = cur_query_tx_qv[cell_idx]
+            else:
+                # 超出实际细胞数的填充位置
+                tx_x = torch.zeros((0, 2), dtype=torch.float32)
+                tx_gene_ids = torch.zeros((0,), dtype=torch.long)
+                tx_qv = torch.zeros((0, 1), dtype=torch.float32)
+            tx_count = int(tx_x.shape[0])
+            if tx_count < max_query_tx:
+                # 转录本不足，零填充
+                tx_x = torch.cat([tx_x, torch.zeros((max_query_tx - tx_count, 2), dtype=tx_x.dtype)], dim=0)
+                tx_gene_ids = torch.cat([tx_gene_ids, torch.zeros((max_query_tx - tx_count,), dtype=tx_gene_ids.dtype)], dim=0)
+                tx_qv = torch.cat([tx_qv, torch.zeros((max_query_tx - tx_count, 1), dtype=tx_qv.dtype)], dim=0)
+            elif tx_count > max_query_tx:
+                # 转录本过多，截断
+                tx_x = tx_x[:max_query_tx]
+                tx_gene_ids = tx_gene_ids[:max_query_tx]
+                tx_qv = tx_qv[:max_query_tx]
+                tx_count = max_query_tx
+            # 生成转录本有效掩膜
+            tx_mask = torch.zeros((max_query_tx,), dtype=torch.bool)
+            tx_mask[:tx_count] = True
+            cur_padded_tx_x.append(tx_x)
+            cur_padded_tx_gene_ids.append(tx_gene_ids)
+            cur_padded_tx_qv.append(tx_qv)
+            cur_padded_tx_mask.append(tx_mask)
+        # [max_cells, max_query_tx, ...]
+        padded_query_tx_x.append(torch.stack(cur_padded_tx_x, dim=0))
+        padded_query_tx_gene_ids.append(torch.stack(cur_padded_tx_gene_ids, dim=0))
+        padded_query_tx_qv.append(torch.stack(cur_padded_tx_qv, dim=0))
+        padded_query_tx_mask.append(torch.stack(cur_padded_tx_mask, dim=0))
+
+    # Stack 成 batch tensor
+    padded_centroids = torch.stack(padded_centroids)                     # [B, max_cells, 2]
+    centroid_valid_mask = torch.stack(centroid_valid_mask)               # [B, max_cells]
+    padded_instance_masks = torch.stack(padded_instance_masks)           # [B, max_cells, H, W]
+    padded_instance_target_valid = torch.stack(padded_instance_target_valid)  # [B, max_cells]
+    padded_query_tx_x = torch.stack(padded_query_tx_x)                  # [B, max_cells, max_tx, 2]
+    padded_query_tx_gene_ids = torch.stack(padded_query_tx_gene_ids)    # [B, max_cells, max_tx]
+    padded_query_tx_qv = torch.stack(padded_query_tx_qv)                # [B, max_cells, max_tx, 1]
+    padded_query_tx_mask = torch.stack(padded_query_tx_mask)             # [B, max_cells, max_tx]
+
+    # query 有效条件: 质心存在 且 实例掩膜有效
+    query_valid_mask = centroid_valid_mask & padded_instance_target_valid  # [B, max_cells]
+
     return {
         'img': imgs,
         'mask': masks,
-        'omics_x': omics_x,
-        'omics_gene_ids': omics_gene_ids,
-        'omics_qv': omics_qv,
+        'query_tx_x': padded_query_tx_x,
+        'query_tx_gene_ids': padded_query_tx_gene_ids,
+        'query_tx_qv': padded_query_tx_qv,
+        'query_tx_mask': padded_query_tx_mask,
         'centroids': padded_centroids,
         'instance_masks': padded_instance_masks,
         'instance_target_valid': padded_instance_target_valid,
@@ -188,7 +290,15 @@ def custom_collate_fn(batch):
         'query_valid_mask': query_valid_mask,
     }
 
+
 def evaluate(model, dataloader, use_amp, amp_dtype, query_score_threshold, instance_mask_threshold, instance_match_iou_threshold, instance_min_area, instance_top_k, use_cls_score):
+    """
+    验证循环 — 在验证集上计算实例级分割指标
+
+    两种评估方式并行:
+        1. PP (Post-Processed): 经过后处理 (阈值筛选/NMS/最小面积过滤) 后的指标
+        2. Aligned: 直接用 Hungarian 匹配 query 到 GT (跳过后处理)
+    """
     model.eval()
     instance_metrics_list = []
     aligned_instance_metrics_list = []
@@ -199,12 +309,23 @@ def evaluate(model, dataloader, use_amp, amp_dtype, query_score_threshold, insta
             query_valid_mask = batch_data['query_valid_mask'].cuda(non_blocking=True)
             instance_masks = batch_data['instance_masks'].cuda(non_blocking=True)
             instance_target_valid = batch_data['instance_target_valid'].cuda(non_blocking=True)
-            omics_x = [x.cuda(non_blocking=True) for x in batch_data['omics_x']]
-            omics_gene_ids = [x.cuda(non_blocking=True) for x in batch_data['omics_gene_ids']]
-            omics_qv = [x.cuda(non_blocking=True) for x in batch_data['omics_qv']]
+            query_tx_x = batch_data['query_tx_x'].cuda(non_blocking=True)
+            query_tx_gene_ids = batch_data['query_tx_gene_ids'].cuda(non_blocking=True)
+            query_tx_qv = batch_data['query_tx_qv'].cuda(non_blocking=True)
+            query_tx_mask = batch_data['query_tx_mask'].cuda(non_blocking=True)
 
             with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
-                output_cls, output_mask = model(imgs, omics_x, centroids, omics_gene_ids=omics_gene_ids, omics_qv=omics_qv)
+                output_cls, output_mask = model(
+                    imgs,
+                    query_tx_x,
+                    centroids,
+                    omics_gene_ids=query_tx_gene_ids,
+                    omics_qv=query_tx_qv,
+                    omics_valid_mask=query_tx_mask,
+                    query_valid_mask=query_valid_mask,
+                )
+
+            # 后处理实例评估
             batch_instances = postprocess_instance_predictions(
                     output_cls.detach(),
                     output_mask.detach(),
@@ -222,6 +343,7 @@ def evaluate(model, dataloader, use_amp, amp_dtype, query_score_threshold, insta
                 instance_target_valid,
                 match_iou_threshold=instance_match_iou_threshold,
             )
+            # Aligned 实例评估 (直接匹配)
             aligned_instance_metrics = compute_aligned_instance_metrics(
                 output_cls.detach(),
                 output_mask.detach(),
@@ -233,6 +355,7 @@ def evaluate(model, dataloader, use_amp, amp_dtype, query_score_threshold, insta
             )
             instance_metrics_list.append(instance_metrics)
             aligned_instance_metrics_list.append(aligned_instance_metrics)
+
     if len(instance_metrics_list) == 0:
         return {
             'pp_inst_precision': 0.0,
@@ -249,6 +372,7 @@ def evaluate(model, dataloader, use_amp, amp_dtype, query_score_threshold, insta
             'aligned_inst_matched_iou': 0.0,
         }
 
+    # 对所有 batch 的指标取均值
     reduced_metrics = {}
     for key in instance_metrics_list[0].keys():
         reduced_metrics[key] = float(np.mean([m[key] for m in instance_metrics_list]))
@@ -257,19 +381,31 @@ def evaluate(model, dataloader, use_amp, amp_dtype, query_score_threshold, insta
     reduced_metrics['aligned_inst_matched_iou'] = float(np.mean([m['inst_matched_iou'] for m in aligned_instance_metrics_list]))
     return reduced_metrics
 
+
 def main():
+    """
+    OVSegFormer 训练主函数
+
+    训练流程:
+        1. 加载配置 → 构建模型 (DataParallel) → 构建数据集和 DataLoader
+        2. 初始化实例级损失函数 (AlignedInstanceSegLoss 或 HungarianInstanceSegLoss)
+        3. 训练循环: 前向 → 计算损失 → 反向传播 → 梯度裁剪 → 参数更新
+        4. 定期验证 → 保存最优模型 (按 PP_InstF1 排序)
+        5. 异常中断时紧急保存权重
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument('cfg', type=str, help='config file path')
     parser.add_argument('--log_dir', type=str, default='work_dir', help='log dir')
-    # 增加了一个参数，方便手动指定保存位置
     parser.add_argument('--checkpoint_dir', type=str, default='', help='checkpoint dir')
     args = parser.parse_args()
 
+    # 固定随机种子确保可复现
     FixSeed = 123
     random.seed(FixSeed)
     np.random.seed(FixSeed)
     torch.manual_seed(FixSeed)
     torch.cuda.manual_seed(FixSeed)
+    # 启用 cuDNN benchmark 和 TF32 以加速 4090D 上的训练
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -277,23 +413,26 @@ def main():
         torch.set_float32_matmul_precision("high")
 
     cfg = Config.fromfile(args.cfg)
-    
-    # --- [改进] 动态生成保存路径 ---
-    # 优先使用命令行参数，否则使用 config 里的 work_dir
+
+    # 权重保存路径: 优先命令行参数，其次配置文件中的 work_dir
     save_root = args.checkpoint_dir if args.checkpoint_dir else cfg.work_dir
     if not os.path.exists(save_root):
         os.makedirs(save_root, exist_ok=True)
-    
+
     logger = getLogger(os.path.join(save_root, 'train.log'), __name__)
     logger.info(f'Config loaded from {args.cfg}')
     logger.info(f'Weights will be saved to: {save_root}')
 
+    # 构建模型并包裹 DataParallel (多卡训练)
     model = build_model(**cfg.model)
     model = torch.nn.DataParallel(model).cuda()
     model.train()
-    
+
+    # 构建训练/验证数据集
     train_dataset = build_dataset(**cfg.dataset.train)
     val_dataset = build_dataset(**cfg.dataset.val)
+
+    # 从配置中读取超参数
     batch_size = getattr(cfg.dataset.train, 'batch_size', 16)
     val_batch_size = getattr(cfg.dataset.val, 'batch_size', 1)
     num_workers = getattr(cfg.process, 'num_works', 16)
@@ -302,12 +441,16 @@ def main():
     prefetch_factor = getattr(cfg.process, 'prefetch_factor', 2)
     log_interval = getattr(cfg.process, 'log_interval', 10)
     val_interval = max(1, int(getattr(cfg.process, 'val_epochs', 1)))
+
+    # 混合精度设置 (优先 bfloat16，4090D 原生支持)
     use_amp = getattr(cfg, 'use_amp', True)
     amp_dtype_cfg = str(getattr(cfg, 'amp_dtype', 'bfloat16')).lower()
     if amp_dtype_cfg == 'bfloat16' and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         amp_dtype = torch.bfloat16
     else:
         amp_dtype = torch.float16
+
+    # 实例评估阈值
     metric_threshold = getattr(cfg, 'metric_threshold', 0.5)
     query_score_threshold = getattr(cfg, 'query_score_threshold', 0.5)
     instance_mask_threshold = getattr(cfg, 'instance_mask_threshold', metric_threshold)
@@ -315,14 +458,20 @@ def main():
     instance_min_area = int(getattr(cfg, 'instance_min_area', 16))
     instance_top_k = getattr(cfg, 'instance_top_k', None)
     instance_use_cls_score = bool(getattr(cfg, 'instance_use_cls_score', False))
+
+    # 梯度裁剪
     grad_clip_max_norm = float(getattr(cfg, 'grad_clip_max_norm', 0.0))
     grad_norm_type = float(getattr(cfg, 'grad_norm_type', 2.0))
+
+    # 诊断和 sanity overfit 设置
     diag_interval = int(getattr(cfg.process, 'diagnostic_interval', getattr(cfg, 'diagnostic_interval', log_interval)))
     sanity_cfg = getattr(cfg, 'sanity_overfit', None)
     sanity_enabled = bool(getattr(sanity_cfg, 'enabled', False)) if sanity_cfg is not None else False
     sanity_num_samples = int(getattr(sanity_cfg, 'num_samples', 16)) if sanity_cfg is not None else 16
     sanity_repeat_factor = int(getattr(sanity_cfg, 'repeat_factor', 20)) if sanity_cfg is not None else 20
     sanity_val_samples = int(getattr(sanity_cfg, 'val_samples', sanity_num_samples)) if sanity_cfg is not None else sanity_num_samples
+
+    # Sanity overfit 模式: 用少量数据反复训练，验证 loss 能否下降 (调试用)
     if sanity_enabled:
         train_len = len(train_dataset)
         val_len = len(val_dataset)
@@ -344,6 +493,7 @@ def main():
         train_sampler = None
         train_shuffle = True
 
+    # 构建 DataLoader
     loader_kwargs = dict(
         batch_size=batch_size,
         shuffle=train_shuffle,
@@ -370,12 +520,15 @@ def main():
         val_loader_kwargs['prefetch_factor'] = prefetch_factor
     val_dataloader = DataLoader(val_dataset, **val_loader_kwargs)
 
+    # 优化器、学习率调度器、AMP GradScaler
     optimizer = pyutils.get_optimizer(model, cfg.optimizer)
     scheduler = build_scheduler(optimizer, cfg)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    # 获取 DataParallel 内部的原始模型引用 (用于保存干净的 state_dict)
     model_without_wrapper = model.module if hasattr(model, 'module') else model
-    
-    # --- [初始化真正的损失函数] ---
+
+    # 初始化实例级损失函数
     instance_loss_cfg = getattr(cfg, 'instance_loss', None)
     instance_loss_type = str(getattr(instance_loss_cfg, 'type', 'AlignedInstanceSegLoss')) if instance_loss_cfg is not None else 'AlignedInstanceSegLoss'
     instance_cls_weight = getattr(instance_loss_cfg, 'cls_weight', 1.0) if instance_loss_cfg is not None else 1.0
@@ -388,6 +541,7 @@ def main():
     matcher_dice_cost = getattr(instance_loss_cfg, 'matcher_dice_cost', 1.0) if instance_loss_cfg is not None else 1.0
     mask_loss_size = getattr(instance_loss_cfg, 'mask_loss_size', 128) if instance_loss_cfg is not None else 128
     overlap_loss_size = getattr(instance_loss_cfg, 'overlap_loss_size', 64) if instance_loss_cfg is not None else 64
+
     if instance_loss_type == 'HungarianInstanceSegLoss':
         instance_criterion = HungarianInstanceSegLoss(
             cls_weight=instance_cls_weight,
@@ -413,30 +567,44 @@ def main():
     else:
         raise ValueError(f'Unsupported instance_loss.type: {instance_loss_type}')
     loss_meter = LossUtil({})
-    
+
     global_step = 0
     best_inst_f1 = float('-inf')
-    
+
+    # ===== 主训练循环 =====
     try:
         for epoch in range(cfg.process.train_epochs):
             model.train()
             epoch_loss = []
-            
+
             iter_start = time.perf_counter()
             for n_iter, batch_data in enumerate(train_dataloader):
                 data_time = time.perf_counter() - iter_start
+
+                # 数据搬运到 GPU (non_blocking=True 异步传输)
                 imgs = batch_data['img'].cuda(non_blocking=True)
                 masks = batch_data['mask'].cuda(non_blocking=True)
                 centroids = batch_data['centroids'].cuda(non_blocking=True)
                 query_valid_mask = batch_data['query_valid_mask'].cuda(non_blocking=True)
                 instance_masks = batch_data['instance_masks'].cuda(non_blocking=True)
                 instance_target_valid = batch_data['instance_target_valid'].cuda(non_blocking=True)
-                omics_x = [x.cuda(non_blocking=True) for x in batch_data['omics_x']]
-                omics_gene_ids = [x.cuda(non_blocking=True) for x in batch_data['omics_gene_ids']]
-                omics_qv = [x.cuda(non_blocking=True) for x in batch_data['omics_qv']]
+                query_tx_x = batch_data['query_tx_x'].cuda(non_blocking=True)
+                query_tx_gene_ids = batch_data['query_tx_gene_ids'].cuda(non_blocking=True)
+                query_tx_qv = batch_data['query_tx_qv'].cuda(non_blocking=True)
+                query_tx_mask = batch_data['query_tx_mask'].cuda(non_blocking=True)
 
+                # 前向传播 (混合精度)
                 with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
-                    output_cls, output_mask = model(imgs, omics_x, centroids, omics_gene_ids=omics_gene_ids, omics_qv=omics_qv)
+                    output_cls, output_mask = model(
+                        imgs,
+                        query_tx_x,
+                        centroids,
+                        omics_gene_ids=query_tx_gene_ids,
+                        omics_qv=query_tx_qv,
+                        omics_valid_mask=query_tx_mask,
+                        query_valid_mask=query_valid_mask,
+                    )
+                    # 计算实例级损失
                     instance_loss, instance_loss_dict, _ = instance_criterion(
                         output_cls,
                         output_mask,
@@ -447,7 +615,8 @@ def main():
                     if not torch.isfinite(loss):
                         raise RuntimeError(f'Non-finite loss detected: {loss.item()}')
                     loss_dict = dict(instance_loss_dict)
-                
+
+                # 反向传播 + 梯度裁剪 + 参数更新
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -462,6 +631,7 @@ def main():
                 epoch_loss.append(loss.item())
                 loss_meter.add_loss(loss, loss_dict)
 
+                # 定期日志输出 (训练指标 + 速度 + 梯度范数)
                 iter_time = time.perf_counter() - iter_start
                 if global_step % log_interval == 0:
                     imgs_per_sec = batch_size / iter_time if iter_time > 0 else 0.0
@@ -508,6 +678,8 @@ def main():
                         f'grad_pre_clip: {grad_norm_pre_clip:.4f}, grad_post_clip: {grad_norm_post_clip:.4f}, '
                         f'lr: {optimizer.param_groups[0]["lr"]:.8f}'
                     )
+
+                # 定期 query 诊断 (检查分类头是否饱和)
                 if global_step % diag_interval == 0:
                     score_diag = summarize_query_scores(output_cls.detach(), query_valid_mask, query_score_threshold)
                     mask_prob = torch.sigmoid(output_mask.detach())
@@ -521,6 +693,7 @@ def main():
                     )
                 iter_start = time.perf_counter()
 
+            # 每 epoch 结束保存 latest 权重 (保存干净的 state_dict，去除 .module 前缀)
             save_path = os.path.join(save_root, 'latest.pth')
             checkpoint = {
                 'epoch': epoch,
@@ -531,10 +704,12 @@ def main():
             torch.save(checkpoint, save_path)
             logger.info(f'>>> Epoch {epoch} finished. Model saved to {save_path}')
 
+            # 每 10 epoch 保存历史权重
             if (epoch + 1) % 10 == 0:
                 history_path = os.path.join(save_root, f'epoch_{epoch+1}.pth')
                 torch.save(model_without_wrapper.state_dict(), history_path)
 
+            # 定期验证
             if (epoch + 1) % val_interval == 0:
                 val_metrics = evaluate(
                     model,
@@ -561,6 +736,7 @@ def main():
                     f'AlignedInstIoU: {val_metrics["aligned_inst_mean_iou"]:.4f}, '
                     f'AlignedMatchedIoU: {val_metrics["aligned_inst_matched_iou"]:.4f}'
                 )
+                # 按 PP_InstF1 保存最优模型
                 if val_metrics['pp_inst_f1'] > best_inst_f1:
                     best_inst_f1 = val_metrics['pp_inst_f1']
                     best_inst_f1_path = os.path.join(save_root, 'best_inst_f1.pth')
@@ -569,10 +745,13 @@ def main():
                     torch.save(best_inst_f1_checkpoint, best_inst_f1_path)
                     logger.info(f'>>> Best InstF1 updated to {best_inst_f1:.4f}. Model saved to {best_inst_f1_path}')
                 model.train()
+
+            # 学习率调度
             if scheduler is not None:
                 scheduler.step()
 
     except Exception as e:
+        # 异常中断时紧急保存权重
         emergency_path = os.path.join(save_root, 'emergency_exit_model.pth')
         torch.save(model_without_wrapper.state_dict(), emergency_path)
         logger.error(f'!!! 训练因错误中断: {str(e)}')

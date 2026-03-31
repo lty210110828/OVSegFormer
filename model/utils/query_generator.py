@@ -1,25 +1,35 @@
 import torch
 import torch.nn as nn
 
-# --- [新增核心模块] Module 3: 核引导 Query 生成器 ---
+
 class NucleiGuidedQueryGenerator(nn.Module):
+    """
+    核引导 Query 生成器 — OVSegFormer 的核心创新之一
+
+    将细胞核质心的归一化坐标 (x, y) 通过 MLP 映射为高维 query embedding，
+    替代原 AVSegFormer 中基于音频特征的 query 生成方式
+
+    每个细胞核质心 → 一个 query → 用于 Transformer 解码器预测该细胞的分割掩膜
+
+    设计思路:
+        - 低维坐标 (2D) 通过 MLP 提升到高维语义空间 (256D)
+        - LayerNorm 保证训练稳定性
+        - Xavier 初始化确保初始阶段梯度均匀
+    """
     def __init__(self, input_dim=2, embed_dim=256, hidden_dim=128):
         """
         Args:
-            input_dim: 输入坐标维度，通常是 2 (x, y)
-            embed_dim: 输出 Query 的维度，必须与 Transformer Decoder 的 hidden_dim 一致 (通常 256)
-            hidden_dim: 中间层维度
+            input_dim: 输入坐标维度 (2 = x, y)
+            embed_dim: 输出 query 维度 (须与 Transformer d_model 一致)
+            hidden_dim: MLP 隐藏层维度
         """
         super().__init__()
-        # 使用 MLP (多层感知机) 将低维坐标映射为高维语义向量
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, embed_dim),
-            nn.LayerNorm(embed_dim) # LayerNorm 有助于训练稳定
+            nn.LayerNorm(embed_dim),
         )
-
-        # 权重初始化 (可选，但推荐)
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -32,15 +42,15 @@ class NucleiGuidedQueryGenerator(nn.Module):
     def forward(self, centroids):
         """
         Args:
-            centroids: 归一化后的质心坐标 [Batch, N_cells, 2]
+            centroids: [B, N_cells, 2] 归一化质心坐标
+
         Returns:
-            query_embeddings: [Batch, N_cells, embed_dim]
+            [B, N_cells, embed_dim] query embeddings
         """
-        # 简单直接：坐标 -> 向量
         return self.mlp(centroids)
 
 
-# --- [以下是原代码，保留以防报错] ---
+# --- [以下是原 AVSegFormer 代码，保留以防报错，不注释] ---
 
 class RepeatGenerator(nn.Module):
     def __init__(self, query_num) -> None:
@@ -104,13 +114,16 @@ class AttentionGenerator(nn.Module):
         return query
 
 
-# --- [修改后的 Builder 函数] ---
 def build_generator(type, **kwargs):
+    """
+    工厂函数: 根据配置中的 type 字段构建对应的 Query 生成器
+    支持: NucleiGuidedQueryGenerator (本项目), AttentionGenerator, RepeatGenerator (原项目)
+    """
     if type == 'AttentionGenerator':
         return AttentionGenerator(**kwargs)
     elif type == 'RepeatGenerator':
         return RepeatGenerator(**kwargs)
-    elif type == 'NucleiGuidedQueryGenerator': # <--- 新增：注册您的模块
+    elif type == 'NucleiGuidedQueryGenerator':
         return NucleiGuidedQueryGenerator(**kwargs)
     else:
         raise ValueError(f"Unknown generator type: {type}")

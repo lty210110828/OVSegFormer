@@ -18,33 +18,28 @@ from scipy.optimize import linear_sum_assignment
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# [原 AVSegFormer 代码 — 保留但不注释]
+# ============================================================
+
 def save_checkpoint(state, epoch, is_best, checkpoint_dir='./models', filename='checkpoint', thres=100):
-    """
-    - state
-    - epoch
-    - is_best
-    - checkpoint_dir: default, ./models
-    - filename: default, checkpoint
-    - freq: default, 10
-    - thres: default, 100
-    """
     if not os.path.isdir(checkpoint_dir):
         os.makedirs(checkpoint_dir)
-
     if epoch >= thres:
-        file_path = os.path.join(
-            checkpoint_dir, filename + '_{}'.format(str(epoch)) + '.pth.tar')
+        file_path = os.path.join(checkpoint_dir, filename + '_{}'.format(str(epoch)) + '.pth.tar')
     else:
         file_path = os.path.join(checkpoint_dir, filename + '.pth.tar')
     torch.save(state, file_path)
     logger.info('==> save model at {}'.format(file_path))
-
     if is_best:
-        cpy_file = os.path.join(
-            checkpoint_dir, filename + '_model_best.pth.tar')
+        cpy_file = os.path.join(checkpoint_dir, filename + '_model_best.pth.tar')
         shutil.copyfile(file_path, cpy_file)
         logger.info('==> save best model at {}'.format(cpy_file))
 
+
+# ============================================================
+# [OVSegFormer 实例评估函数]
+# ============================================================
 
 def compute_aligned_instance_metrics(
     output_cls,
@@ -57,6 +52,19 @@ def compute_aligned_instance_metrics(
     force_keep_top1=True,
     eps=1e-6,
 ):
+    """
+    Aligned 实例指标计算 — 直接用 Hungarian 匹配 query 到 GT (跳过后处理)
+
+    流程:
+        1. 将 output_mask 插值到 GT 尺寸
+        2. 按 query_score 过滤有效预测
+        3. 二值化后计算 pred↔gt 的 IoU 矩阵
+        4. 用 linear_sum_assignment 做 Hungarian 最优匹配
+        5. 按 match_iou_threshold 判定 TP/FP/FN → 计算 Precision/Recall/F1
+
+    Returns:
+        dict: inst_precision, inst_recall, inst_f1, inst_mean_iou, inst_matched_iou, ...
+    """
     if output_mask.shape[-2:] != instance_masks.shape[-2:]:
         flat_masks = output_mask.reshape(-1, 1, output_mask.shape[-2], output_mask.shape[-1])
         flat_masks = F.interpolate(flat_masks, size=instance_masks.shape[-2:], mode='bilinear', align_corners=False)
@@ -65,6 +73,7 @@ def compute_aligned_instance_metrics(
     query_scores = torch.sigmoid(output_cls.squeeze(-1))
     valid_mask = instance_target_valid.bool()
     keep_mask = valid_mask if query_score_threshold is None else (valid_mask & (query_scores >= query_score_threshold))
+    # 兜底: 如果某样本所有 query 都低于阈值，保留最高分的那个
     if query_score_threshold is not None:
         if force_keep_top1:
             any_valid = valid_mask.any(dim=1)
@@ -97,6 +106,7 @@ def compute_aligned_instance_metrics(
         if cur_target.shape[0] == 0 or cur_pred.shape[0] == 0:
             continue
 
+        # 计算 IoU 矩阵 + Hungarian 匹配
         pred_flat = cur_pred.flatten(1)
         target_flat = cur_target.flatten(1)
         inter = pred_flat @ target_flat.t()
@@ -114,6 +124,7 @@ def compute_aligned_instance_metrics(
         if matched.any():
             matched_iou_values.append(matched_ious[matched])
 
+        # 计算预测实例间的平均重叠率 (Overlap metric)
         kept_pred = cur_pred
         if kept_pred.shape[0] > 1:
             kept_flat = kept_pred.flatten(1)
@@ -163,6 +174,25 @@ def postprocess_instance_predictions(
     use_cls_score=False,
     eps=1e-6,
 ):
+    """
+    后处理实例预测 — 将 query 输出转换为离散实例掩膜列表
+
+    流程:
+        1. 按 query_score 过滤低分 query (可选)
+        2. 二值化掩膜
+        3. 像素归属 NMS: 每个像素只属于 ownership_prob 最高的 query
+        4. 过滤面积 < min_area 的实例
+        5. 可选: 按 score 取 top-K
+
+    Args:
+        output_cls: [B, N, 1] objectness logits
+        output_mask: [B, N, H, W] 掩膜 logits
+        query_valid_mask: [B, N] 有效 query 布尔掩膜
+
+    Returns:
+        batch_instances: list of list of dict, 每个 dict 包含:
+            query_idx, score, area, mask (二值 tensor)
+    """
     if target_size is not None and output_mask.shape[-2:] != tuple(target_size):
         flat_masks = output_mask.reshape(-1, 1, output_mask.shape[-2], output_mask.shape[-1])
         flat_masks = F.interpolate(flat_masks, size=target_size, mode='bilinear', align_corners=False)
@@ -178,6 +208,7 @@ def postprocess_instance_predictions(
             batch_instances.append([])
             continue
 
+        # 按 query 分数过滤
         cur_scores = query_scores[batch_idx, valid_idx]
         keep = torch.ones_like(cur_scores, dtype=torch.bool)
         if use_cls_score and query_score_threshold is not None:
@@ -192,16 +223,19 @@ def postprocess_instance_predictions(
         if kept_idx.numel() == 0:
             batch_instances.append([])
             continue
+
+        # 像素归属 NMS: 每个像素只属于概率最高的 query
         ownership_prob = kept_masks
         if use_cls_score:
             ownership_prob = ownership_prob * kept_scores[:, None, None]
         best_prob, best_local_idx = ownership_prob.max(dim=0)
         foreground = best_prob > mask_threshold
+
         selected_instances = []
         for local_rank, query_idx in enumerate(kept_idx.tolist()):
             bin_mask = foreground & (best_local_idx == local_rank)
             area = int(bin_mask.sum().item())
-            if area < int(min_area):
+            if area < int(min_area):  # 过滤过小的实例
                 continue
             mask_values = kept_masks[local_rank][bin_mask]
             score = float(mask_values.mean().item()) if mask_values.numel() > 0 else float(kept_scores[local_rank].item())
@@ -219,6 +253,7 @@ def postprocess_instance_predictions(
 
 
 def instances_to_label_map(instances, image_size):
+    """将实例列表转换为标签图 (每个实例分配唯一整数 ID)"""
     label_map = np.zeros(image_size, dtype=np.int32)
     for inst_id, inst in enumerate(instances, start=1):
         mask = inst['mask'].numpy().astype(bool)
@@ -233,6 +268,13 @@ def compute_postprocessed_instance_metrics(
     match_iou_threshold=0.5,
     eps=1e-6,
 ):
+    """
+    后处理实例指标计算 — 评估 postprocess_instance_predictions 的输出
+
+    与 compute_aligned_instance_metrics 的区别:
+        - 输入是后处理后的实例列表 (而非原始 query 输出)
+        - 更接近实际部署时的评估方式
+    """
     total_gt = 0.0
     total_pred = 0.0
     total_match = 0.0
@@ -252,6 +294,7 @@ def compute_postprocessed_instance_metrics(
             continue
 
         pred_masks = torch.stack(pred_masks, dim=0)
+        # IoU 矩阵 + Hungarian 匹配
         pred_flat = pred_masks.flatten(1)
         gt_flat = gt_masks.flatten(1)
         inter = pred_flat @ gt_flat.t()
@@ -268,6 +311,7 @@ def compute_postprocessed_instance_metrics(
         if matched.any():
             matched_iou_values.append(matched_ious[matched])
 
+        # 预测实例间重叠率
         if pred_masks.shape[0] > 1:
             pair_inter = pred_flat @ pred_flat.t()
             denom = torch.minimum(pred_area, pred_area.t()).clamp_min(eps)
@@ -297,6 +341,7 @@ def compute_postprocessed_instance_metrics(
 
 
 def build_instance_label_map_from_masks(masks):
+    """将一组二值掩膜转换为标签图 (每个掩膜分配唯一 ID)"""
     if isinstance(masks, torch.Tensor):
         masks = masks.detach().cpu().numpy()
     label_map = np.zeros(masks.shape[-2:], dtype=np.int32)
@@ -306,6 +351,7 @@ def build_instance_label_map_from_masks(masks):
 
 
 def colorize_label_map(label_map):
+    """将整数标签图转换为彩色可视化图 (每个实例一种颜色)"""
     label_map = np.asarray(label_map, dtype=np.int32)
     color = np.zeros(label_map.shape + (3,), dtype=np.uint8)
     unique_ids = np.unique(label_map)
@@ -322,6 +368,7 @@ def colorize_label_map(label_map):
 
 
 def tensor_to_uint8_image(img_tensor):
+    """将 PyTorch tensor 转换为 uint8 numpy 图像 (用于可视化)"""
     if isinstance(img_tensor, torch.Tensor):
         img = img_tensor.detach().cpu().float().numpy()
     else:
@@ -344,15 +391,23 @@ def tensor_to_uint8_image(img_tensor):
 
 
 def create_instance_diagnostic_panel(img_tensor, gt_label_map, pred_label_map):
+    """
+    创建 2×2 诊断面板: 原图 | GT 标签图 / Pred 标签图 | Error Map
+
+    Error Map 颜色编码:
+        绿色 = TP (GT 和 Pred 都有)
+        红色 = FN (GT 有但 Pred 没有)
+        蓝色 = FP (Pred 有但 GT 没有)
+    """
     img = tensor_to_uint8_image(img_tensor)
     gt_color = colorize_label_map(gt_label_map)
     pred_color = colorize_label_map(pred_label_map)
     gt_union = gt_label_map > 0
     pred_union = pred_label_map > 0
     error_map = np.zeros_like(img)
-    error_map[np.logical_and(gt_union, pred_union)] = np.array([0, 255, 0], dtype=np.uint8)
-    error_map[np.logical_and(gt_union, ~pred_union)] = np.array([255, 0, 0], dtype=np.uint8)
-    error_map[np.logical_and(~gt_union, pred_union)] = np.array([0, 0, 255], dtype=np.uint8)
+    error_map[np.logical_and(gt_union, pred_union)] = np.array([0, 255, 0], dtype=np.uint8)   # TP
+    error_map[np.logical_and(gt_union, ~pred_union)] = np.array([255, 0, 0], dtype=np.uint8)  # FN
+    error_map[np.logical_and(~gt_union, pred_union)] = np.array([0, 0, 255], dtype=np.uint8)  # FP
     top = np.concatenate([img, gt_color], axis=1)
     bottom = np.concatenate([pred_color, error_map], axis=1)
     return np.concatenate([top, bottom], axis=0)
@@ -365,6 +420,13 @@ def collect_postprocessed_instance_diagnostics(
     match_iou_threshold=0.5,
     eps=1e-6,
 ):
+    """
+    收集逐样本/逐实例的诊断数据
+
+    Returns:
+        sample_rows: 每个样本的汇总 (gt_count, pred_count, matched_count, ...)
+        instance_rows: 每个实例的匹配详情 (query_idx, score, matched_gt_id, status=tp/fp)
+    """
     sample_rows = []
     instance_rows = []
 
@@ -378,6 +440,7 @@ def collect_postprocessed_instance_diagnostics(
         matched_iou_values = []
 
         if gt_count > 0 and pred_count > 0:
+            # Hungarian 匹配
             pred_masks = torch.stack(
                 [inst['mask'].to(device=gt_masks.device, dtype=torch.float32) for inst in instances],
                 dim=0
@@ -412,6 +475,7 @@ def collect_postprocessed_instance_diagnostics(
             'mean_pred_score': mean_pred_score,
         })
 
+        # 逐实例匹配状态 (tp/fp)
         sample_instance_rows = []
         for pred_idx, inst in enumerate(instances, start=1):
             matched_gt_id = -1
@@ -436,6 +500,10 @@ def collect_postprocessed_instance_diagnostics(
 
     return sample_rows, instance_rows
 
+
+# ============================================================
+# [原 AVSegFormer 评估代码 — 保留但不注释]
+# ============================================================
 
 def mask_iou(pred, target, eps=1e-7, size_average=True):
     r"""
@@ -490,7 +558,6 @@ def Eval_Fmeasure(pred, gt, pr_num=255):
             iou: size [1] (size_average=True) or [N] (size_average=False)
     """
     print('=> eval [FMeasure]..')
-    # =======================================[important]
     pred = torch.sigmoid(pred)
     N = pred.size(0)
     beta2 = 0.3
@@ -499,12 +566,11 @@ def Eval_Fmeasure(pred, gt, pr_num=255):
     print("{} videos in this batch".format(N))
 
     for img_id in range(N):
-        # examples with totally black GTs are out of consideration
         if torch.mean(gt[img_id]) == 0.0:
             continue
         prec, recall = _eval_pr(pred[img_id], gt[img_id], pr_num)
         f_score = (1 + beta2) * prec * recall / (beta2 * prec + recall)
-        f_score[f_score != f_score] = 0  # for Nan
+        f_score[f_score != f_score] = 0
         avg_f += f_score
         img_num += 1
         score = avg_f / img_num
@@ -513,27 +579,21 @@ def Eval_Fmeasure(pred, gt, pr_num=255):
 
 
 def save_mask(pred_masks, save_base_path, video_name_list):
-    # pred_mask: [bs*5, 1, 224, 224]
-    # print(f"=> {len(video_name_list)} videos in this batch")
-
     if not os.path.exists(save_base_path):
         os.makedirs(save_base_path, exist_ok=True)
-
     pred_masks = pred_masks.squeeze(2)
     pred_masks = (torch.sigmoid(pred_masks) > 0.5).int()
-
     pred_masks = pred_masks.view(-1, 5,
                                  pred_masks.shape[-2], pred_masks.shape[-1])
     pred_masks = pred_masks.cpu().data.numpy().astype(np.uint8)
     pred_masks *= 255
     bs = pred_masks.shape[0]
-
     for idx in range(bs):
         video_name = video_name_list[idx]
         mask_save_path = os.path.join(save_base_path, video_name)
         if not os.path.exists(mask_save_path):
             os.makedirs(mask_save_path, exist_ok=True)
-        one_video_masks = pred_masks[idx]  # [5, 1, 224, 224]
+        one_video_masks = pred_masks[idx]
         for video_id in range(len(one_video_masks)):
             one_mask = one_video_masks[video_id]
             output_name = "%s_%d.png" % (video_name, video_id)
@@ -553,7 +613,6 @@ def save_raw_img_mask(anno_file_path, raw_img_base_path, mask_base_path, split='
             raw_img = cv2.imread(os.path.join(raw_img_path, img_name))
             mask = cv2.imread(os.path.join(
                 mask_base_path, 'pred_masks', video_name, "%s_%d.png" % (video_name, img_id)))
-            # pdb.set_trace()
             raw_img_mask = cv2.addWeighted(raw_img, 1, mask, r, 0)
             save_img_path = os.path.join(
                 mask_base_path, 'img_add_masks', video_name)
